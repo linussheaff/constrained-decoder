@@ -1,0 +1,12 @@
+# Colab-specific extras.
+#
+# Colab images already ship with recent torch, transformers, datasets,
+# accelerate, tqdm, matplotlib, and numpy — installing them again is just
+# noise and risks breaking the runtime. This file lists only the deps Colab
+# does NOT pre-install (spaCy + the small English NER pipeline, rouge_score).
+#
+# Usage in a Colab cell:
+#   !pip install -q -r requirements-colab.txt
+#   !python -m spacy download en_core_web_sm
+spacy>=3.7
+rouge-score>=0.1.2

@@ -1,0 +1,13 @@
+torch>=2.1
+transformers>=4.40
+accelerate>=0.30
+datasets>=2.18
+evaluate>=0.4
+spacy>=3.7
+outlines>=0.0.40
+matplotlib>=3.7
+seaborn>=0.13
+pydantic>=2.5
+pytest>=7.4
+numpy>=1.24
+tqdm>=4.66
