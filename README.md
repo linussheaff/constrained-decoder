@@ -4,7 +4,7 @@ Research project investigating whether **selective constrained decoding** can
 reduce factual hallucination in abstractive summarisation without degrading
 output quality.
 
-## A simple writeup of the findingcs can be found in WRITEUP.md
+## A simple writeup of the findingcs can be found in results/WRITEUP.md
 
 
 ## Running on Colab
