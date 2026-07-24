@@ -9,20 +9,38 @@ from typing import Any, Iterable, Sequence
 import torch
 from transformers import LogitsProcessorList
 
-from .constraint_builder import GroundedConstraint, build_constraint
+from .constraint_builder import (
+    GroundedConstraint,
+    NegativeTrie,
+    build_constraint,
+    build_negative_trie,
+)
 from .detector import HeuristicFactualSpanDetector
 from .entity_extractor import SourceFacts, extract_facts
 from .grounded_logits_processor import (
     FlatAllowlistLogitsProcessor,
+    NegativeTrieLogitsProcessor,
     TrieSelectiveLogitsProcessor,
 )
 
 
-CONDITION_NAMES: tuple[str, ...] = (
+# Conditions that precede the (optionally swept) selective_soft slot.
+_HEAD_CONDITIONS: tuple[str, ...] = (
     "unconstrained",
     "fully_constrained_hard",
     "selective_hard",
-    "selective_soft",
+)
+
+# Negative-trie conditions always come last. They are not swept: the negative
+# mask is stateless, so the penalty is a plain bias rather than the runaway
+# risk the selective sweep exists to characterise.
+_NEGATIVE_CONDITIONS: tuple[str, ...] = (
+    "negative_hard",
+    "negative_soft",
+)
+
+CONDITION_NAMES: tuple[str, ...] = (
+    _HEAD_CONDITIONS + ("selective_soft",) + _NEGATIVE_CONDITIONS
 )
 
 
@@ -45,12 +63,8 @@ def expand_condition_names(
     """
     if not soft_penalty_sweep:
         return CONDITION_NAMES
-    head = (
-        "unconstrained",
-        "fully_constrained_hard",
-        "selective_hard",
-    )
-    return head + tuple(soft_condition_name(p) for p in soft_penalty_sweep)
+    swept = tuple(soft_condition_name(p) for p in soft_penalty_sweep)
+    return _HEAD_CONDITIONS + swept + _NEGATIVE_CONDITIONS
 
 
 @dataclass
@@ -61,6 +75,11 @@ class ConditionalSummary:
     text: str
     new_token_ids: list[int]
     fraction_constrained: float | None = None  # None for non-selective conditions
+    # Negative-trie conditions only: share of steps where the penalty
+    # overturned the model's preferred token. The negative mask is applied at
+    # every step, so "how often was it active" is uninformative (always) —
+    # this measures how often it actually bit.
+    fraction_diverted: float | None = None
 
     @property
     def n_new_tokens(self) -> int:
@@ -131,6 +150,7 @@ def generate_summaries(
     extra_token_ids: Iterable[int] | None = None,
     detector: HeuristicFactualSpanDetector | None = None,
     constraint: GroundedConstraint | None = None,
+    negative_trie: NegativeTrie | None = None,
     source_facts: SourceFacts | None = None,
     spacy_model: str = "en_core_web_sm",
 ) -> dict[str, ConditionalSummary]:
@@ -159,6 +179,9 @@ def generate_summaries(
             list). Default :class:HeuristicFactualSpanDetector.
         constraint: Override the constraint construction. Useful when the
             same source is used many times.
+        negative_trie: Override the negative-trie construction (the blocklist
+            of tokens that could only begin an off-source entity). Built from
+            the source and tokenizer by default.
         source_facts: Pre-computed source facts. Avoids re-running spaCy.
         spacy_model: spaCy pipeline used if source_facts is None.
 
@@ -176,6 +199,14 @@ def generate_summaries(
             else _default_extra_token_ids(tokenizer)
         )
         constraint = build_constraint(source_facts, extra_token_ids=extras)
+
+    if negative_trie is None:
+        negative_trie = build_negative_trie(
+            source,
+            tokenizer,
+            facts=source_facts,
+            extra_allowed_token_ids=_default_extra_token_ids(tokenizer),
+        )
 
     if detector is None:
         detector = HeuristicFactualSpanDetector()
@@ -256,6 +287,30 @@ def generate_summaries(
             text=text,
             new_token_ids=ids,
             fraction_constrained=sel_soft.fraction_constrained,
+        )
+
+    # 5. Negative trie — penalise tokens that could only *begin* an entity the
+    # source doesn't contain. Stateless and detector-free, so unlike the
+    # selective conditions it cannot get stuck inside a span.
+    for name, penalty in (
+        ("negative_hard", float("inf")),
+        ("negative_soft", float(soft_penalty)),
+    ):
+        neg_proc = NegativeTrieLogitsProcessor.from_negative_trie(
+            negative_trie, penalty=penalty
+        )
+        text, ids = _greedy_generate(
+            model,
+            tokenizer,
+            inputs,
+            LogitsProcessorList([neg_proc]),
+            max_new_tokens,
+        )
+        results[name] = ConditionalSummary(
+            name=name,
+            text=text,
+            new_token_ids=ids,
+            fraction_diverted=neg_proc.fraction_diverted,
         )
 
     return results

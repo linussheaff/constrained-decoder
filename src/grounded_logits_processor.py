@@ -1,7 +1,9 @@
 """HuggingFace ``LogitsProcessor`` variants for source-grounded constrained decoding.
 
-Three process are provided that share mask-construction and caching machinery; the selective
-variants add a per-step gate plus diagnostic counters.
+Four processors are provided that share mask-construction and caching
+machinery; the selective variants add a per-step gate plus diagnostic
+counters, and the negative variant inverts the mask (blocklist rather than
+allowlist) to drop the state entirely.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ from typing import Iterable
 import torch
 from transformers.generation.logits_process import LogitsProcessor
 
-from .constraint_builder import GroundedConstraint
+from .constraint_builder import GroundedConstraint, NegativeTrie
 from .detector import DecodableTokenizer, HeuristicFactualSpanDetector
 
 
@@ -437,8 +439,137 @@ class TrieSelectiveLogitsProcessor(LogitsProcessor):
         return self._apply_mask(scores, allowed)
 
 
+class NegativeTrieLogitsProcessor(LogitsProcessor):
+    """Penalise tokens that could only begin an entity absent from the source.
+
+    * **Stateless.** There is no live set and no detector; the mask is a fixed
+      function of the source, identical at every step. Nothing accumulates, so
+      nothing can run away.
+    * **Blocklist, not allowlist.** Only entity-initial tokens are touched
+      (see :func:`~src.constraint_builder.build_negative_trie`). Function
+      words, verbs, sub-word continuations, punctuation and EOS are never
+      masked, so the decoder always has an escape route and can always stop.
+    * **Never forces completion.** The model is discouraged from *starting* an
+      unsupported entity; it is never obliged to finish a supported one. It
+      can always fall back on a generic paraphrase.
+
+    Args:
+        blocked_token_ids: Token IDs to penalise — typically
+            ``NegativeTrie.blocked_token_ids``.
+        penalty: Amount subtracted from blocked scores. ``inf`` (default)
+            removes them outright; a finite value biases against them while
+            leaving the model free to overrule the constraint.
+
+    Notes:
+        Batch-safe: the mask depends only on the source, so it broadcasts over
+        the batch like :class:`FlatAllowlistLogitsProcessor`.
+    """
+
+    def __init__(
+        self,
+        blocked_token_ids: Iterable[int],
+        penalty: float = float("inf"),
+    ) -> None:
+        if penalty < 0:
+            raise ValueError(f"penalty must be non-negative; got {penalty}")
+        ids = sorted({int(t) for t in blocked_token_ids})
+        if ids and min(ids) < 0:
+            raise ValueError(f"blocked_token_ids must be non-negative; got {min(ids)}")
+        self._blocked_ids: list[int] = ids
+        self._penalty: float = float(penalty)
+        self._mask_cache: torch.Tensor | None = None
+        self._mask_vocab: int | None = None
+        self._mask_device: torch.device | None = None
+        self._n_steps: int = 0
+        self._n_diverted: int = 0
+
+    @classmethod
+    def from_negative_trie(
+        cls,
+        negative: "NegativeTrie",
+        penalty: float = float("inf"),
+    ) -> "NegativeTrieLogitsProcessor":
+        return cls(negative.blocked_token_ids, penalty=penalty)
+
+    @property
+    def num_blocked(self) -> int:
+        return len(self._blocked_ids)
+
+    @property
+    def is_hard_mask(self) -> bool:
+        return math.isinf(self._penalty)
+
+    @property
+    def penalty(self) -> float:
+        return self._penalty
+
+    @property
+    def n_steps(self) -> int:
+        return self._n_steps
+
+    @property
+    def n_diverted(self) -> int:
+        """Steps where the penalty changed the greedy choice."""
+        return self._n_diverted
+
+    @property
+    def fraction_diverted(self) -> float:
+        """Share of steps where the constraint actually bit.
+
+        The analogue of ``fraction_constrained`` for the selective
+        processors — but note it means something stricter. The mask here is
+        applied at *every* step, so the informative quantity isn't how often
+        it was active (always) but how often it overturned the model's
+        preferred token.
+        """
+        return self._n_diverted / self._n_steps if self._n_steps else 0.0
+
+    def reset(self) -> None:
+        """Zero the diagnostic counters; call between generations."""
+        self._n_steps = 0
+        self._n_diverted = 0
+
+    def _build_mask(self, vocab_size: int, device: torch.device) -> torch.Tensor:
+        """Boolean mask of shape (vocab_size,) where True == BLOCK."""
+        mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
+        if self._blocked_ids:
+            idx = torch.tensor(self._blocked_ids, dtype=torch.long, device=device)
+            idx = idx[idx < vocab_size]
+            if idx.numel():
+                mask[idx] = True
+        return mask
+
+    def __call__(
+        self, input_ids: torch.LongTensor, scores: torch.FloatTensor
+    ) -> torch.FloatTensor:
+        vocab_size = scores.shape[-1]
+        if (
+            self._mask_cache is None
+            or self._mask_vocab != vocab_size
+            or self._mask_device != scores.device
+        ):
+            self._mask_cache = self._build_mask(vocab_size, scores.device)
+            self._mask_vocab = vocab_size
+            self._mask_device = scores.device
+        mask = self._mask_cache
+
+        self._n_steps += 1
+        if not self._blocked_ids:
+            return scores
+
+        before = scores.argmax(dim=-1)
+        if self.is_hard_mask:
+            out = scores.masked_fill(mask, -float("inf"))
+        else:
+            out = scores - self._penalty * mask.to(scores.dtype)
+        if not torch.equal(before, out.argmax(dim=-1)):
+            self._n_diverted += 1
+        return out
+
+
 __all__ = [
     "FlatAllowlistLogitsProcessor",
+    "NegativeTrieLogitsProcessor",
     "SelectiveLogitsProcessor",
     "TrieSelectiveLogitsProcessor",
 ]

@@ -25,12 +25,16 @@ CONDITION_ORDER: tuple[str, ...] = (
     "fully_constrained_hard",
     "selective_hard",
     "selective_soft",
+    "negative_hard",
+    "negative_soft",
 )
 CONDITION_COLOURS: dict[str, str] = {
     "unconstrained": "#4c72b0",
     "fully_constrained_hard": "#c44e52",
     "selective_hard": "#55a868",
     "selective_soft": "#8172b2",
+    "negative_hard": "#dd8452",
+    "negative_soft": "#937860",
 }
 
 # Colour ramp for selective_soft_pN sweep conditions,
@@ -200,16 +204,24 @@ def _selective_activation_plot(
     sweep_index = sweep_index or {}
     fig, ax = plt.subplots(figsize=(6, 4))
     plotted = False
-    selective = tuple(c for c in conditions if c.startswith("selective"))
+    selective = tuple(
+        c for c in conditions if c.startswith(("selective", "negative"))
+    )
     if not selective:
         selective = ("selective_hard", "selective_soft")
     for cond in selective:
+        # The negative conditions constrain every step, so their comparable
+        # quantity is how often the penalty overturned the greedy choice.
+        metric = (
+            "fraction_diverted" if cond.startswith("negative")
+            else "fraction_constrained"
+        )
         values: list[float] = []
         for record in per_example:
             payload = record.get("conditions", {}).get(cond)
             if not payload:
                 continue
-            f = payload.get("fraction_constrained")
+            f = payload.get(metric)
             if f is None:
                 continue
             values.append(float(f))
@@ -228,9 +240,11 @@ def _selective_activation_plot(
         plt.close(fig)
         logger.info("no fraction_constrained data; skipping %s", output_path)
         return
-    ax.set_xlabel("fraction of steps with constraints active")
+    ax.set_xlabel(
+        "fraction of steps constrained (selective) / diverted (negative)"
+    )
     ax.set_ylabel("examples")
-    ax.set_title("Selective detector activation rate")
+    ax.set_title("Constraint activation rate")
     ax.set_xlim(0.0, 1.0)
     ax.legend()
     fig.tight_layout()
@@ -289,6 +303,20 @@ def _soft_sweep_curve(
         color="#55a868",
         label="entity precision",
     )
+    summacs = [
+        _per_condition_metric(per_example, "summac_zs", (c,)).get(c, [])
+        for c in sweep
+    ]
+    if any(summacs):
+        ax1.plot(
+            penalties,
+            [mean(v) for v in summacs],
+            marker="^",
+            linestyle="--",
+            color="#937860",
+            label="SummaC-ZS",
+        )
+        ax1.legend(loc="lower right", fontsize=9)
     ax2.plot(
         penalties,
         rouge_means,
@@ -355,6 +383,21 @@ def plot_all(result: dict[str, Any], output_dir: Path) -> list[Path]:
             sweep_index=sweep_index,
         )
         written.append(path)
+
+    # SummaC-ZS is optional (the run may have used --no-summac), so only draw
+    # its figure when the records actually carry scores.
+    summac_values = _per_condition_metric(per_example, "summac_zs", conditions)
+    if any(values for values in summac_values.values()):
+        summac_path = output_dir / "summac_zs.png"
+        _bar_plot(
+            title="SummaC-ZS (vitc) — NLI entailment minus contradiction",
+            ylabel="mean SummaC-ZS score",
+            values_per_condition=summac_values,
+            output_path=summac_path,
+            conditions=conditions,
+            sweep_index=sweep_index,
+        )
+        written.append(summac_path)
 
     scatter_path = output_dir / "faithfulness_vs_quality.png"
     _scatter_faithfulness_vs_quality(

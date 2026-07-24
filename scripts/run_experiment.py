@@ -34,8 +34,9 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from src.entity_extractor import extract_facts  
 from src.evaluate_faithfulness import evaluate_faithfulness  
-from src.evaluate_quality import evaluate_quality  
-from src.generate import (  
+from src.evaluate_quality import evaluate_quality
+from src.evaluate_summac import DEFAULT_NLI_MODEL, SummaCZS
+from src.generate import (
     CONDITION_NAMES,
     expand_condition_names,
     generate_summaries,
@@ -71,6 +72,9 @@ class ExperimentConfig:
     output: str
     instruction: str
     soft_penalty_sweep: tuple[float, ...] | None = None
+    summac: bool = True
+    summac_model: str = DEFAULT_NLI_MODEL
+    summac_device: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -217,6 +221,8 @@ _METRIC_KEYS: tuple[str, ...] = (
     "entity_recall",
     "entity_f1",
     "number_accuracy",
+    "summac_zs",
+    "summac_zs_min",
     "hallucinated_entity_count",
     "unsupported_number_count",
     "rouge1",
@@ -225,6 +231,7 @@ _METRIC_KEYS: tuple[str, ...] = (
     "length_chars",
     "length_tokens",
     "fraction_constrained",
+    "fraction_diverted",
     "n_new_tokens",
 )
 
@@ -277,13 +284,16 @@ def _flatten_metrics(
     fraction_constrained: float | None,
     faith: Any,
     quality: Any,
+    fraction_diverted: float | None = None,
+    summac: Any = None,
 ) -> dict[str, Any]:
     """Merge the dataclass reports into a flat dict for JSON serialisation."""
-    return {
+    record: dict[str, Any] = {
         "name": condition_name,
         "text": text,
         "n_new_tokens": len(new_token_ids),
         "fraction_constrained": fraction_constrained,
+        "fraction_diverted": fraction_diverted,
         # Faithfulness
         "entity_precision": faith.entity_precision,
         "entity_recall": faith.entity_recall,
@@ -302,6 +312,12 @@ def _flatten_metrics(
         "length_chars": quality.length_chars,
         "length_tokens": quality.length_tokens,
     }
+    if summac is not None:
+        # SummaC-ZS: NLI entailment minus contradiction, in [-1, 1].
+        record["summac_zs"] = summac.score
+        record["summac_zs_min"] = summac.min_sentence_score
+        record["summac_sentence_scores"] = summac.sentence_scores
+    return record
 
 
 def process_example(
@@ -312,6 +328,7 @@ def process_example(
     max_new_tokens: int,
     soft_penalty: float,
     soft_penalty_sweep: Sequence[float] | None = None,
+    summac_scorer: SummaCZS | None = None,
 ) -> dict[str, Any]:
     """Run all conditions on a single example and return a serialisable record."""
     article = example["article"]
@@ -336,13 +353,18 @@ def process_example(
     for name, summary in summaries.items():
         faith = evaluate_faithfulness(summary.text, article, source_facts=source_facts)
         quality = evaluate_quality(summary.text, reference=reference, tokenizer=tokenizer)
+        summac = None
+        if summac_scorer is not None:
+            summac = summac_scorer.score(summary.text, article)
         cond_records[name] = _flatten_metrics(
             condition_name=name,
             text=summary.text,
             new_token_ids=summary.new_token_ids,
             fraction_constrained=summary.fraction_constrained,
+            fraction_diverted=summary.fraction_diverted,
             faith=faith,
             quality=quality,
+            summac=summac,
         )
 
     return {
@@ -366,12 +388,34 @@ def _set_seeds(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _build_summac_scorer(config: ExperimentConfig) -> SummaCZS | None:
+    """Construct (and eagerly load) the SummaC-ZS scorer, or None if disabled.
+
+    Loading here rather than on first use means a missing checkpoint or a
+    download failure surfaces before we spend GPU minutes generating.
+    """
+    if not config.summac:
+        return None
+    scorer = SummaCZS(model_name=config.summac_model, device=config.summac_device)
+    try:
+        scorer.score("A test sentence.", "A test sentence.")
+    except Exception as exc:
+        logger.error(
+            "Could not load SummaC-ZS model %s (%s); continuing without it.",
+            config.summac_model,
+            exc,
+        )
+        return None
+    return scorer
+
+
 def run_experiment(
     config: ExperimentConfig,
     examples: list[dict[str, str]] | None = None,
     model: Any | None = None,
     tokenizer: Any | None = None,
     progress: bool = True,
+    summac_scorer: SummaCZS | None = None,
 ) -> dict[str, Any]:
     """Run the experiment and return the result dict (also written to disk).
 
@@ -380,6 +424,8 @@ def run_experiment(
         examples: Pre-loaded examples (skip dataset loading). Used by tests.
         model, tokenizer: Pre-loaded model/tokenizer (skip HF load). Used by tests.
         progress: Show tqdm progress bar (set False for clean test output).
+        summac_scorer: Pre-built SummaC-ZS scorer (skip the NLI load). When
+            None and ``config.summac`` is set, one is built here.
     """
     _set_seeds(config.seed)
 
@@ -394,6 +440,9 @@ def run_experiment(
     examples = list(examples)[: config.n]
     if not examples:
         raise ValueError("No examples available to run.")
+
+    if summac_scorer is None:
+        summac_scorer = _build_summac_scorer(config)
 
     logger.info(
         "Running %d examples × %d conditions = %d generations",
@@ -425,6 +474,7 @@ def run_experiment(
                 max_new_tokens=config.max_new_tokens,
                 soft_penalty=config.soft_penalty,
                 soft_penalty_sweep=config.soft_penalty_sweep,
+                summac_scorer=summac_scorer,
             )
         except Exception as exc:  # one bad example shouldn't kill the run
             logger.exception("Example idx=%s failed: %s", example.get("idx"), exc)
@@ -482,6 +532,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="results/raw/experiment.json")
     parser.add_argument("--instruction", default=DEFAULT_INSTRUCTION)
     parser.add_argument(
+        "--no-summac",
+        dest="summac",
+        action="store_false",
+        help=(
+            "Skip the SummaC-ZS NLI metric (saves a ~900MB model download and "
+            "an NLI forward pass per sentence pair)."
+        ),
+    )
+    parser.add_argument(
+        "--summac-model",
+        default=DEFAULT_NLI_MODEL,
+        help="NLI checkpoint for SummaC-ZS (default: the paper's vitc weights)",
+    )
+    parser.add_argument(
+        "--summac-device",
+        default=None,
+        help="Device for the SummaC NLI model; defaults to the same auto-detection "
+        "as the generator (use 'cpu' to keep GPU memory free for generation).",
+    )
+    parser.add_argument(
         "--quiet", action="store_true", help="suppress tqdm progress bar"
     )
     return parser
@@ -512,6 +582,9 @@ def main(argv: list[str] | None = None) -> int:
         output=args.output,
         instruction=args.instruction,
         soft_penalty_sweep=sweep,
+        summac=args.summac,
+        summac_model=args.summac_model,
+        summac_device=args.summac_device,
     )
     run_experiment(config, progress=not args.quiet)
     return 0

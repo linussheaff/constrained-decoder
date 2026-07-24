@@ -103,6 +103,7 @@ class TestRunExperimentSmoke:
             device="cpu",
             output=str(output),
             instruction=DEFAULT_INSTRUCTION,
+            summac=False,
         )
         result = run_experiment(
             config,
@@ -152,6 +153,7 @@ class TestRunExperimentSmoke:
             device="cpu",
             output=str(output),
             instruction=DEFAULT_INSTRUCTION,
+            summac=False,
         )
         bad_examples = [
             {"idx": 0, "article": SOURCE, "reference": REFERENCE},
@@ -186,6 +188,7 @@ class TestSoftPenaltySweep:
             device="cpu",
             output=str(tmp_path / "sweep.json"),
             instruction=DEFAULT_INSTRUCTION,
+            summac=False,
             soft_penalty_sweep=sweep,
         )
         # Conditions list should reflect the sweep.
@@ -196,6 +199,10 @@ class TestSoftPenaltySweep:
             "selective_soft_p2",
             "selective_soft_p5",
             "selective_soft_p10",
+            # The negative-trie conditions are not swept — they sit after the
+            # sweep, at the single soft_penalty value.
+            "negative_hard",
+            "negative_soft",
         )
         assert config.conditions == expected
 
@@ -216,6 +223,105 @@ class TestSoftPenaltySweep:
             # Aggregate covers each sweep condition.
             assert set(blob["aggregate"]) == set(expected)
             assert blob["config"]["soft_penalty_sweep"] == list(sweep)
+
+
+class TestSummaCIntegration:
+    """SummaC-ZS plumbing, with the NLI model stubbed out.
+
+    Downloading the real vitc weights would dominate the test runtime, so we
+    only check that a scorer's output reaches the JSON, the aggregate, and
+    the figures.
+    """
+
+    class _StubSummaC:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def score(self, summary: str, source: str):
+            from src.evaluate_summac import SummaCReport
+
+            self.calls += 1
+            return SummaCReport(
+                summary=summary,
+                source=source,
+                score=0.5,
+                sentence_scores=[0.7, 0.3],
+                summary_sentences=["a.", "b."],
+                n_source_sentences=3,
+            )
+
+    def _config(self, tmp_path: Path) -> ExperimentConfig:
+        return ExperimentConfig(
+            model="sshleifer/tiny-gpt2",
+            dataset="(synthetic)",
+            split="(none)",
+            n=2,
+            seed=0,
+            max_new_tokens=4,
+            soft_penalty=1.0,
+            dtype="float32",
+            device="cpu",
+            output=str(tmp_path / "summac.json"),
+            instruction=DEFAULT_INSTRUCTION,
+        )
+
+    def test_scores_land_in_json_and_aggregate(
+        self, tiny_lm, spacy_nlp, tmp_path
+    ) -> None:
+        tok, mdl = tiny_lm
+        scorer = self._StubSummaC()
+        config = self._config(tmp_path)
+        result = run_experiment(
+            config,
+            examples=_synthetic_examples(),
+            model=mdl,
+            tokenizer=tok,
+            progress=False,
+            summac_scorer=scorer,
+        )
+
+        assert scorer.calls == 2 * len(CONDITIONS)
+        on_disk = json.loads(Path(config.output).read_text())
+        for blob in (result, on_disk):
+            for record in blob["per_example"]:
+                for payload in record["conditions"].values():
+                    assert payload["summac_zs"] == pytest.approx(0.5)
+                    assert payload["summac_zs_min"] == pytest.approx(0.3)
+                    assert payload["summac_sentence_scores"] == [0.7, 0.3]
+            for cond_metrics in blob["aggregate"].values():
+                assert cond_metrics["summac_zs"]["mean"] == pytest.approx(0.5)
+
+    def test_disabled_run_omits_summac_keys(self, tiny_lm, spacy_nlp, tmp_path) -> None:
+        tok, mdl = tiny_lm
+        config = self._config(tmp_path)
+        config.summac = False
+        result = run_experiment(
+            config,
+            examples=_synthetic_examples()[:1],
+            model=mdl,
+            tokenizer=tok,
+            progress=False,
+        )
+        for payload in result["per_example"][0]["conditions"].values():
+            assert "summac_zs" not in payload
+        # Aggregate still lists the key, with no data behind it.
+        for cond_metrics in result["aggregate"].values():
+            assert cond_metrics["summac_zs"]["mean"] is None
+
+    def test_plot_all_renders_the_summac_figure(
+        self, tiny_lm, spacy_nlp, tmp_path
+    ) -> None:
+        tok, mdl = tiny_lm
+        result = run_experiment(
+            self._config(tmp_path),
+            examples=_synthetic_examples(),
+            model=mdl,
+            tokenizer=tok,
+            progress=False,
+            summac_scorer=self._StubSummaC(),
+        )
+        written = plot_all(result, tmp_path / "figs")
+        assert "summac_zs.png" in {Path(p).name for p in written}
 
 
 class TestAggregateMetrics:
@@ -263,6 +369,7 @@ class TestPlotAllRoundTrip:
             device="cpu",
             output=str(tmp_path / "for_plots.json"),
             instruction=DEFAULT_INSTRUCTION,
+            summac=False,
         )
         result = run_experiment(
             config,

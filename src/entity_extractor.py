@@ -1,11 +1,9 @@
-"""Extract factual spans (named entities and numbers) from source documents.
+"""
+Extract factual spans (named entities and numbers) from source documents.
 
 Given a source document and a tokenizer, this module produces a :class:`SourceFacts`
 object summarising every span that the constrained decoder may later need to
-recognise:
-
-Designed to be lightweight and side-effect free: the spaCy model is loaded
-lazily and cached, and the tokenizer is supplied by the caller.
+recognise.
 """
 
 from __future__ import annotations
@@ -22,8 +20,7 @@ if TYPE_CHECKING:  # pragma: no cover — typing only
 logger = logging.getLogger(__name__)
 
 
-# spaCy entity labels we treat as "factual" — i.e. worth constraining to the
-# source document during generation. 
+# spacy entity labels we treat as "factual" i.e. worth constraining to the source document during generation. 
 FACTUAL_ENTITY_LABELS: frozenset[str] = frozenset(
     {
         "PERSON",
@@ -46,13 +43,12 @@ FACTUAL_ENTITY_LABELS: frozenset[str] = frozenset(
     }
 )
 
-# Pure-numeric labels — useful for downstream filtering / weighting.
+# pure numeric labels which are useful for downstream filtering / weighting.
 NUMERIC_ENTITY_LABELS: frozenset[str] = frozenset(
     {"MONEY", "PERCENT", "QUANTITY", "CARDINAL", "ORDINAL"}
 )
 
-# Permissive number pattern: matches "1", "1.5", "1,000", "1,000.50", "50%",
-# "$100", "£1,200.50", optional leading sign..
+# regex numbers that spacy seems to miss 
 _NUMBER_REGEX = re.compile(
     r"[-+]?[\$£€¥]?\d+(?:,\d{3})*(?:\.\d+)?%?"
 )
@@ -61,8 +57,9 @@ _NUMBER_REGEX = re.compile(
 class TokenizerLike(Protocol):
     """Minimal duck-typed interface we need from a tokenizer.
 
-    Both HuggingFace ``PreTrainedTokenizerBase`` and any well-behaved stub
-    satisfy this protocol.
+    Any well-behaved stub will satisfy this
+
+    Massively saves testing time by avoiding import 
     """
 
     def encode(self, text: str, add_special_tokens: bool = ...) -> list[int]:
@@ -84,14 +81,13 @@ class Number:
     """A numeric span in the source document.
 
     value is the parsed float when the span looks like a plain number
-    (currency symbol and trailing percent stripped) and ``None`` otherwise.
+    (currency symbol and trailing percent stripped) and None otherwise.
     """
 
     text: str
     value: float | None
     start_char: int
     end_char: int
-
 
 @dataclass
 class SourceFacts:
@@ -139,7 +135,7 @@ def _load_spacy(model_name: str) -> "Language":
     """Load and cache a spaCy pipeline by name."""
     try:
         import spacy
-    except ImportError as exc:  # no cover — import guard
+    except ImportError as exc:  # no cover 
         raise RuntimeError(
             "spaCy is required for entity extraction. Install with: "
             "pip install spacy && python -m spacy download en_core_web_sm"
@@ -155,7 +151,7 @@ def _load_spacy(model_name: str) -> "Language":
 
 
 def _parse_number_value(text: str) -> float | None:
-    """Best-effort parse of a numeric span to a float."""
+    """Shit parse of a numeric span to a float if we can."""
     cleaned = text.strip()
     for sym in ("$", "£", "€", "¥"):
         cleaned = cleaned.replace(sym, "")
@@ -188,7 +184,7 @@ def _tokenize_variants(
         try:
             ids = list(tokenizer.encode(variant, add_special_tokens=False))
         except TypeError:
-            # Older tokenizer stubs may not accept the kwarg.
+            # Just in case
             ids = list(tokenizer.encode(variant))
         if not ids:
             continue
@@ -274,6 +270,7 @@ def extract_facts(
     entity_tokens: set[int] = set()
     number_token_sequences: list[list[int]] = []
     number_tokens: set[int] = set()
+    # Tokneizer not required, just get spans without IDs, used in evaluation 
     if tokenizer is not None:
         for ent in entities:
             for seq in _tokenize_variants(ent.text, tokenizer):

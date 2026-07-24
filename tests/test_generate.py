@@ -16,7 +16,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("transformers")
 
-from src.constraint_builder import build_constraint  # noqa: E402
+from src.constraint_builder import NegativeTrie, build_constraint  # noqa: E402
 from src.entity_extractor import extract_facts  # noqa: E402
 from src.generate import (  # noqa: E402
     CONDITION_NAMES,
@@ -51,7 +51,7 @@ PROMPT = "Article: " + SOURCE_DOC + "\nSummary:"
 
 
 class TestGenerateSummariesShape:
-    def test_returns_all_four_conditions(self, tiny_lm, spacy_nlp) -> None:
+    def test_returns_every_condition(self, tiny_lm, spacy_nlp) -> None:
         tok, mdl = tiny_lm
         result = generate_summaries(
             SOURCE_DOC, PROMPT, mdl, tok, max_new_tokens=8
@@ -162,7 +162,52 @@ class TestSoftPenaltySweep:
             "selective_soft_p2",
             "selective_soft_p5",
             "selective_soft_p10",
+            # The negative-trie conditions are not swept — they sit after the
+            # sweep, at the single soft_penalty value.
+            "negative_hard",
+            "negative_soft",
         )
+
+
+class TestNegativeTrieConditions:
+    def test_negative_conditions_report_diversion_not_activation(
+        self, tiny_lm, spacy_nlp
+    ) -> None:
+        tok, mdl = tiny_lm
+        result = generate_summaries(
+            SOURCE_DOC, PROMPT, mdl, tok, max_new_tokens=8
+        )
+        for name in ("negative_hard", "negative_soft"):
+            summary = result[name]
+            # The negative mask is applied at every step, so there is no
+            # "activation" rate to report — only how often it bit.
+            assert summary.fraction_constrained is None
+            assert 0.0 <= summary.fraction_diverted <= 1.0
+
+    def test_selective_conditions_do_not_report_diversion(
+        self, tiny_lm, spacy_nlp
+    ) -> None:
+        tok, mdl = tiny_lm
+        result = generate_summaries(
+            SOURCE_DOC, PROMPT, mdl, tok, max_new_tokens=8
+        )
+        for name in ("unconstrained", "selective_hard", "selective_soft"):
+            assert result[name].fraction_diverted is None
+
+    def test_explicit_negative_trie_is_honoured(self, tiny_lm, spacy_nlp) -> None:
+        # An empty blocklist must leave the negative conditions identical to
+        # the unconstrained run — the constraint is the only difference.
+        tok, mdl = tiny_lm
+        result = generate_summaries(
+            SOURCE_DOC,
+            PROMPT,
+            mdl,
+            tok,
+            max_new_tokens=8,
+            negative_trie=NegativeTrie(blocked_token_ids=frozenset()),
+        )
+        assert result["negative_hard"].text == result["unconstrained"].text
+        assert result["negative_hard"].fraction_diverted == 0.0
 
 
 class TestExtraTokenIdsOverride:

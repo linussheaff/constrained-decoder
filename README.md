@@ -57,8 +57,77 @@ python -m spacy download en_core_web_sm
 # Quick smoke run with a tiny model (CPU fine):
 python scripts/run_experiment.py \
     --model sshleifer/tiny-gpt2 --n 3 --max-new-tokens 16 \
-    --output results/raw/smoke.json
+    --no-summac --output results/raw/smoke.json
 python scripts/plot_results.py results/raw/smoke.json
+```
+
+## Decoding conditions
+
+| condition | constraint | state |
+| --- | --- | --- |
+| `unconstrained` | none | — |
+| `fully_constrained_hard` | flat source allowlist, every step | none |
+| `selective_hard` | entity trie, gated by the detector | live trie set |
+| `selective_soft` | as above, finite penalty | live trie set |
+| `negative_hard` | off-source entity openers blocked | **none** |
+| `negative_soft` | off-source entity openers penalised | **none** |
+
+### The negative trie
+
+The selective conditions are *positive*: once the detector fires, the decoder
+is committed to walking the entity trie to a terminal. That commitment is the
+runaway — an over-eager detector re-enters a span every step and the summary
+collapses into concatenated source entities (`fully_constrained_hard` in the
+table above shows the same failure in its pure form).
+
+The negative trie inverts the question. Instead of asking "what may I emit
+next?" it asks "may this token *begin* a fact the source doesn't contain?",
+and penalises the tokens for which the answer is no. That question needs no
+history, so the mask is a fixed function of the source, identical at every
+step — there is no span to be trapped inside and no streak to accumulate. A
+token is a candidate only if it is word-initial and starts with a capital,
+digit or currency symbol, so function words, verbs, sub-word continuations,
+punctuation and EOS are never touched: the decoder always has an escape route
+and can always terminate. On GPT-2's vocabulary a typical XSum article leaves
+~32k of 50k tokens completely unconstrained.
+
+**It reduces hallucination; it does not eliminate it.** The guarantee is
+one-sided — the *opening* token is blocked, but continuations are lower-case
+and so never candidates. A decoder that finds any licensed opener walks
+off-source from there: a source containing "Scottish" licenses `" Scott"`,
+and "Scott Beattie" follows for free. On a 10-prompt greedy GPT-2 probe this
+cut hallucinated entities from 11 to 7. Raising `min_prefix_match` closes the
+short-token route (`" B"` + `"arclays"`) but did not improve that number at
+any setting tried. Closing the gap properly needs within-word state.
+
+## Faithfulness metrics
+
+Two complementary families:
+
+* **Lexical** (`evaluate_faithfulness.py`) — entity precision/recall and
+  number accuracy, computed by matching spans against the source. Cheap and
+  interpretable, but blind to relational errors: a summary that swaps the
+  subject and object of a source sentence keeps perfect entity precision.
+* **NLI-based** (`evaluate_summac.py`) — **SummaC-ZS** (Laban et al., TACL
+  2022) with the `vitc` weights (`tals/albert-xlarge-vitaminc-mnli`), the
+  configuration the paper scores best with. Every (source sentence, summary
+  sentence) pair is run through the NLI model; each summary sentence is
+  scored `max(entailment) - max(contradiction)` over source sentences, and
+  the document score is the mean over summary sentences. Range `[-1, 1]`,
+  higher is more faithful.
+
+SummaC-ZS is on by default in `run_experiment.py`. It costs a ~900MB model
+download plus one NLI forward pass per sentence pair, so for quick smoke runs
+pass `--no-summac`; `--summac-device cpu` keeps GPU memory free for
+generation on a small T4.
+
+```python
+from src.evaluate_summac import SummaCZS
+
+scorer = SummaCZS()                       # loads the vitc weights lazily
+report = scorer.score(summary, article)
+report.score                              # mean over summary sentences
+report.sentence_scores                    # per-sentence, to localise the failure
 ```
 
 ## Tests
@@ -75,11 +144,12 @@ loaded; pure-string tests always run.
 ```
 src/
   entity_extractor.py            # spaCy NER + regex numbers → SourceFacts
-  constraint_builder.py          # TokenAllowlist + multi-token entity trie
+  constraint_builder.py          # TokenAllowlist, entity trie, negative trie
   detector.py                    # heuristic factual-span detector
-  grounded_logits_processor.py   # FlatAllowlist + Selective LogitsProcessors
-  generate.py                    # one-call: 4 conditions on one source doc
+  grounded_logits_processor.py   # FlatAllowlist/Selective/NegativeTrie processors
+  generate.py                    # one-call: 6 conditions on one source doc
   evaluate_faithfulness.py       # entity P/R, number accuracy, hallucination
+  evaluate_summac.py             # SummaC-ZS (vitc NLI) entailment scoring
   evaluate_quality.py            # ROUGE-1/2/L + length
 
 scripts/
