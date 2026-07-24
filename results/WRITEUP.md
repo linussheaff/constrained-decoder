@@ -227,9 +227,9 @@ the v3 sweep (eight conditions × 200 examples).
 ## Note on use of generative AI
 
 Generative AI was used in this project in the following ways. 
-- **Developing unit and Integration tests for code** As an undergraduate, fairly new to software development best practices I used generative AI to develop unit and integration tests for my code. 
-- **Proof reading and formatting this file** I'm not great at markdown, LLMs are great at markdown. I also used it to improve the clarity, spelling and grammar of my writing. 
+- **Developing unit and Integration tests for code** As an undergraduate fairly new to software development best practices, I used generative AI to develop unit and integration tests for my code. 
+- **Proof reading and formatting this file** I'm not great at markdown, LLMs are great at markdown. I also used it to improve the clarity, spelling, and grammar of my writing. 
 - **Documenting and preparing code for release** My code was poorly (and very informally) documented. I used generative AI to improve the doc strings and comments on my work, and to refactor some of my code so that it was more succinct. 
-- **Wrting the README.md** The readme file is almost entirely AI generated, but just includes basic information about how to run the project. 
+- **Wrting the README.md** The readme file is almost entirely AI generated but only includes basic information about how to run the project. 
 
-Note that generative AI was not used to generate ideas or research directions and was not used to intepret data. This was an educational project, intended to improve my research skills and using generative AI in this way would not have been productive. 
+Note that generative AI was not used to generate ideas or research directions and was not used to intepret data. This was an educational project, intended to improve my research skills. Using generative AI in this way would not have been productive. 
